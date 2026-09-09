@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod crypto_test;
+#[cfg(test)]
+mod signature_test;
 
 pub mod crypto_cbc;
 pub mod crypto_ccm;
@@ -313,11 +315,34 @@ fn verify_signature(
 
     let verify_alg: &dyn ring::signature::VerificationAlgorithm = match hash_algorithm.signature {
         SignatureAlgorithm::Ed25519 => &ring::signature::ED25519,
-        SignatureAlgorithm::Ecdsa if hash_algorithm.hash == HashAlgorithm::Sha256 => {
-            &ring::signature::ECDSA_P256_SHA256_ASN1
-        }
-        SignatureAlgorithm::Ecdsa if hash_algorithm.hash == HashAlgorithm::Sha384 => {
-            &ring::signature::ECDSA_P384_SHA384_ASN1
+        SignatureAlgorithm::Ecdsa => {
+            // DTLS 1.2 signature/hash pairs do not constrain the signing curve.
+            // In particular, Teams can sign with a P-384 key and SHA-256.
+            // Use the certificate's signing curve, not the ECDHE curve or hash.
+            let public_key_algorithm = &certificate.tbs_certificate.subject_pki.algorithm;
+            if public_key_algorithm.algorithm != OID_ECDSA {
+                return Err(Error::ErrKeySignatureVerifyUnimplemented);
+            }
+            let curve = public_key_algorithm
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.as_oid().ok())
+                .ok_or(Error::ErrKeySignatureVerifyUnimplemented)?;
+            match (curve, hash_algorithm.hash) {
+                (curve, HashAlgorithm::Sha256) if curve == oid!(1.2.840 .10045 .3 .1 .7) => {
+                    &ring::signature::ECDSA_P256_SHA256_ASN1
+                }
+                (curve, HashAlgorithm::Sha384) if curve == oid!(1.2.840 .10045 .3 .1 .7) => {
+                    &ring::signature::ECDSA_P256_SHA384_ASN1
+                }
+                (curve, HashAlgorithm::Sha256) if curve == oid!(1.3.132 .0 .34) => {
+                    &ring::signature::ECDSA_P384_SHA256_ASN1
+                }
+                (curve, HashAlgorithm::Sha384) if curve == oid!(1.3.132 .0 .34) => {
+                    &ring::signature::ECDSA_P384_SHA384_ASN1
+                }
+                _ => return Err(Error::ErrKeySignatureVerifyUnimplemented),
+            }
         }
         SignatureAlgorithm::Rsa if hash_algorithm.hash == HashAlgorithm::Sha1 => {
             &ring::signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY
