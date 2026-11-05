@@ -20,7 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            ice-test-args: ""
+          - os: macos-latest
+            # This real-multicast test also stalls on the unpatched base on
+            # hosted macOS: actions/runs/42045712480. Linux still runs it.
+            ice-test-args: "--skip mdns::mdns_test::test_multicast_dns_only_connection"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -28,6 +34,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: ICE lifecycle and role conflict tests
-        run: cargo test -p webrtc-ice --lib -- --test-threads=1
+        run: cargo test -p webrtc-ice --lib -- --test-threads=1 ${{ matrix.ice-test-args }}
       - name: DTLS, SRTP, and SCTP after ICE negotiation
         run: cargo test -p webrtc --test ice_role_conflict -- --test-threads=1
