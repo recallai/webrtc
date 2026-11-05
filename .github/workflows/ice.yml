@@ -1,0 +1,33 @@
+name: ICE regression tests
+
+on:
+  pull_request:
+    branches: [recallai-patches]
+  push:
+    branches: [recallai-patches]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ice-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ice:
+    name: ICE and encrypted transport (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: ICE lifecycle and role conflict tests
+        run: cargo test -p webrtc-ice --lib -- --test-threads=1
+      - name: DTLS, SRTP, and SCTP after ICE negotiation
+        run: cargo test -p webrtc --test ice_role_conflict -- --test-threads=1

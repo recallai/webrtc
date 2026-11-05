@@ -493,6 +493,56 @@ async fn test_role_conflict_connects_and_transfers_data() {
                     .unwrap();
                 assert_eq!(&data[..n], b"role conflict recovered");
             }
+
+            // An ICE restart changes credentials/candidates, but must retain the
+            // roles settled above (RFC 8445 section 6.1.1). Keep the AgentConns
+            // alive, just as an application keeps its upper-layer transport.
+            let role_a = a.agent.internal.is_controlling.load(Ordering::SeqCst);
+            let role_b = b.agent.internal.is_controlling.load(Ordering::SeqCst);
+            a.agent.restart(String::new(), String::new()).await.unwrap();
+            b.agent.restart(String::new(), String::new()).await.unwrap();
+            let (ufrag_a, pwd_a) = a.agent.get_local_user_credentials().await;
+            let (ufrag_b, pwd_b) = b.agent.get_local_user_credentials().await;
+            a.agent
+                .set_remote_credentials(ufrag_b, pwd_b)
+                .await
+                .unwrap();
+            b.agent
+                .set_remote_credentials(ufrag_a, pwd_a)
+                .await
+                .unwrap();
+            let local_a = candidate(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()), 100);
+            let local_b = candidate(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()), 200);
+            a.agent.internal.add_candidate(&local_a).await.unwrap();
+            b.agent.internal.add_candidate(&local_b).await.unwrap();
+            a.agent.internal.add_remote_candidate(&local_b).await;
+            b.agent.internal.add_remote_candidate(&local_a).await;
+            timeout(Duration::from_secs(5), async {
+                while a.agent.internal.agent_conn.get_selected_pair().is_none()
+                    || b.agent.internal.agent_conn.get_selected_pair().is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("agents did not reconnect after ICE restart");
+            assert_eq!(
+                a.agent.internal.is_controlling.load(Ordering::SeqCst),
+                role_a
+            );
+            assert_eq!(
+                b.agent.internal.is_controlling.load(Ordering::SeqCst),
+                role_b
+            );
+            for (sender, receiver) in [(&conn_a, &conn_b), (&conn_b, &conn_a)] {
+                sender.send(b"data after ICE restart").await.unwrap();
+                let mut data = [0; 128];
+                let n = timeout(Duration::from_secs(1), receiver.recv(&mut data))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&data[..n], b"data after ICE restart");
+            }
             drop((cancel_a, cancel_b));
             a.agent.close().await.unwrap();
             b.agent.close().await.unwrap();
