@@ -168,6 +168,17 @@ impl AgentInternal {
     }
 
     pub(crate) async fn contact_candidates(&self) {
+        let _role_guard = self.role_lock.lock().await;
+        let triggered = std::mem::take(&mut *self.triggered_checks.lock().await);
+        if !triggered.is_empty() {
+            for pair in triggered {
+                pair.state
+                    .store(CandidatePairState::InProgress as u8, Ordering::SeqCst);
+                pair.binding_request_count.fetch_add(1, Ordering::SeqCst);
+                self.ping_candidate(&pair.local, &pair.remote).await;
+            }
+            return;
+        }
         if self.is_controlling.load(Ordering::SeqCst) {
             ControllingSelector::contact_candidates(self).await;
         } else {

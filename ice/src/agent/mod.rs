@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod agent_gather_test;
 #[cfg(test)]
+mod agent_role_test;
+#[cfg(test)]
 mod agent_test;
 #[cfg(test)]
 mod agent_transport_test;
@@ -57,6 +59,9 @@ pub(crate) struct BindingRequest {
     pub(crate) transaction_id: TransactionId,
     pub(crate) destination: SocketAddr,
     pub(crate) is_use_candidate: bool,
+    pub(crate) local_id: String,
+    pub(crate) is_controlling: bool,
+    pub(crate) role_epoch: u64,
 }
 
 impl Default for BindingRequest {
@@ -66,6 +71,9 @@ impl Default for BindingRequest {
             transaction_id: TransactionId::default(),
             destination: SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 0),
             is_use_candidate: false,
+            local_id: String::new(),
+            is_controlling: false,
+            role_epoch: 0,
         }
     }
 }
@@ -407,6 +415,8 @@ impl Agent {
         }
 
         // Clear all agent needed to take back to fresh state
+        let _role_guard = self.internal.role_lock.lock().await;
+        self.internal.triggered_checks.lock().await.clear();
         {
             let mut ufrag_pwd = self.internal.ufrag_pwd.lock().await;
             ufrag_pwd.local_ufrag = ufrag;
