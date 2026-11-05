@@ -1,12 +1,14 @@
 use portable_atomic::{AtomicBool, AtomicU64};
 
 use arc_swap::ArcSwapOption;
+use stun::error_code::{ErrorCodeAttribute, CODE_ROLE_CONFLICT};
 use util::sync::Mutex as SyncMutex;
 
 use super::agent_transport::*;
 use super::*;
 use crate::candidate::candidate_base::CandidateBaseConfig;
 use crate::candidate::candidate_peer_reflexive::CandidatePeerReflexiveConfig;
+use crate::control::TieBreaker;
 use crate::util::*;
 
 pub type ChanCandidateTx =
@@ -18,6 +20,16 @@ pub(crate) struct UfragPwd {
     pub(crate) local_pwd: String,
     pub(crate) remote_ufrag: String,
     pub(crate) remote_pwd: String,
+}
+
+// MESSAGE-INTEGRITY does not authenticate attributes that follow it.
+fn attribute_is_authenticated(message: &Message, typ: AttrType) -> bool {
+    message
+        .attributes
+        .0
+        .iter()
+        .take_while(|attribute| attribute.typ != ATTR_MESSAGE_INTEGRITY)
+        .any(|attribute| attribute.typ == typ)
 }
 
 pub struct AgentInternal {
@@ -43,6 +55,10 @@ pub struct AgentInternal {
 
     pub(crate) tie_breaker: AtomicU64,
     pub(crate) is_controlling: AtomicBool,
+    // Serialize role changes with incoming checks and the selector's outgoing checks.
+    pub(crate) role_lock: Mutex<()>,
+    pub(crate) role_epoch: AtomicU64,
+    pub(crate) triggered_checks: Mutex<Vec<Arc<CandidatePair>>>,
     pub(crate) lite: AtomicBool,
 
     pub(crate) start_time: SyncMutex<Instant>,
@@ -114,6 +130,9 @@ impl AgentInternal {
 
             tie_breaker: AtomicU64::new(rand::random::<u64>()),
             is_controlling: AtomicBool::new(config.is_controlling),
+            role_lock: Mutex::new(()),
+            role_epoch: AtomicU64::new(0),
+            triggered_checks: Mutex::new(vec![]),
             lite: AtomicBool::new(config.lite),
 
             start_time: SyncMutex::new(Instant::now()),
@@ -184,8 +203,11 @@ impl AgentInternal {
         );
         self.set_remote_credentials(remote_ufrag, remote_pwd)
             .await?;
-        self.is_controlling.store(is_controlling, Ordering::SeqCst);
-        self.start().await;
+        {
+            let _role_guard = self.role_lock.lock().await;
+            self.set_role(is_controlling).await;
+            self.start().await;
+        }
         {
             let mut started_ch_tx = self.started_ch_tx.lock().await;
             started_ch_tx.take();
@@ -409,12 +431,12 @@ impl AgentInternal {
         local: Arc<dyn Candidate + Send + Sync>,
         remote: Arc<dyn Candidate + Send + Sync>,
     ) {
+        let mut checklist = self.agent_conn.checklist.lock().await;
         let p = Arc::new(CandidatePair::new(
             local,
             remote,
             self.is_controlling.load(Ordering::SeqCst),
         ));
-        let mut checklist = self.agent_conn.checklist.lock().await;
         checklist.push(p);
     }
 
@@ -725,6 +747,9 @@ impl AgentInternal {
                 transaction_id: m.transaction_id,
                 destination: remote.addr(),
                 is_use_candidate: m.contains(ATTR_USE_CANDIDATE),
+                local_id: local.id(),
+                is_controlling: m.contains(ATTR_ICE_CONTROLLING),
+                role_epoch: self.role_epoch.load(Ordering::SeqCst),
             });
         }
 
@@ -812,10 +837,162 @@ impl AgentInternal {
         for i in 0..pending_binding_requests.len() {
             if pending_binding_requests[i].transaction_id == id {
                 let valid_binding_request = pending_binding_requests.remove(i);
+                if valid_binding_request.role_epoch != self.role_epoch.load(Ordering::SeqCst) {
+                    return None;
+                }
                 return Some(valid_binding_request);
             }
         }
         None
+    }
+
+    // The caller holds role_lock. Pair priorities are computed from ice_role_controlling,
+    // so updating it also updates the ordering used by the candidate selectors.
+    pub(crate) async fn set_role(&self, is_controlling: bool) {
+        let checklist = self.agent_conn.checklist.lock().await;
+        if self.is_controlling.swap(is_controlling, Ordering::SeqCst) == is_controlling {
+            return;
+        }
+        self.role_epoch.fetch_add(1, Ordering::SeqCst);
+        log::debug!("ICE role changed to {}", self.get_name());
+        let selected = self.agent_conn.get_selected_pair();
+        for pair in &*checklist {
+            pair.ice_role_controlling
+                .store(is_controlling, Ordering::SeqCst);
+            pair.nominate_on_binding_success
+                .store(false, Ordering::SeqCst);
+            if !selected.as_ref().is_some_and(|p| Arc::ptr_eq(p, pair)) {
+                pair.nominated.store(false, Ordering::SeqCst);
+            }
+        }
+        drop(checklist);
+        *self.nominated_pair.lock().await = None;
+        *self.start_time.lock() = Instant::now();
+    }
+
+    async fn send_role_conflict(
+        &self,
+        request: &Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: SocketAddr,
+    ) {
+        let local_pwd = self.ufrag_pwd.lock().await.local_pwd.clone();
+        let mut response = Message::new();
+        if let Err(err) = response.build(&[
+            Box::new(request.clone()),
+            Box::new(BINDING_ERROR),
+            Box::new(CODE_ROLE_CONFLICT),
+            Box::new(MessageIntegrity::new_short_term_integrity(local_pwd)),
+            Box::new(FINGERPRINT),
+        ]) {
+            log::warn!("Failed to build ICE role conflict response: {err}");
+            return;
+        }
+        if let Some(conn) = local.get_conn() {
+            match conn.send_to(&response.raw, remote).await {
+                Ok(_) => local.seen(true),
+                Err(err) => log::trace!("Failed to send ICE role conflict response: {err}"),
+            }
+        }
+    }
+
+    // RFC 8445 section 7.3.1.1. Only called after authenticating the request.
+    async fn resolve_role_conflict(
+        &self,
+        request: &Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: SocketAddr,
+    ) -> bool {
+        for attr in [
+            ATTR_ICE_CONTROLLING,
+            ATTR_ICE_CONTROLLED,
+            ATTR_USE_CANDIDATE,
+        ] {
+            if request.contains(attr) && !attribute_is_authenticated(request, attr) {
+                return false;
+            }
+        }
+        if request.contains(ATTR_ICE_CONTROLLING) && request.contains(ATTR_ICE_CONTROLLED) {
+            return false;
+        }
+        let controlling = self.is_controlling.load(Ordering::SeqCst);
+        let attr = if controlling {
+            ATTR_ICE_CONTROLLING
+        } else {
+            ATTR_ICE_CONTROLLED
+        };
+        if request.contains(attr) {
+            let mut peer_tie_breaker = TieBreaker::default();
+            if peer_tie_breaker.get_from_as(request, attr).is_err() {
+                return false;
+            }
+            let local_tie_breaker = self.tie_breaker.load(Ordering::SeqCst);
+            let switch_role = if controlling {
+                local_tie_breaker < peer_tie_breaker.0
+            } else {
+                local_tie_breaker >= peer_tie_breaker.0
+            };
+            if !switch_role {
+                self.send_role_conflict(request, local, remote).await;
+                return false;
+            }
+            self.set_role(!controlling).await;
+        }
+        !(self.is_controlling.load(Ordering::SeqCst) && request.contains(ATTR_USE_CANDIDATE))
+    }
+
+    // RFC 8445 section 7.2.5.1. A response applies to the role of its request,
+    // not necessarily our current role: a concurrent request may have changed it.
+    async fn handle_role_conflict(
+        &self,
+        response: &Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: &Arc<dyn Candidate + Send + Sync>,
+    ) {
+        let mut code = ErrorCodeAttribute::default();
+        if !attribute_is_authenticated(response, ATTR_ERROR_CODE)
+            || code.get_from(response).is_err()
+            || code.code != CODE_ROLE_CONFLICT
+        {
+            return;
+        }
+        self.invalidate_pending_binding_requests(Instant::now())
+            .await;
+        let request = {
+            let mut pending = self.pending_binding_requests.lock().await;
+            let Some(index) = pending.iter().position(|request| {
+                request.transaction_id == response.transaction_id
+                    && request.destination == remote.addr()
+                    && request.local_id == local.id()
+            }) else {
+                return;
+            };
+            pending.remove(index)
+        };
+        if request.role_epoch != self.role_epoch.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(pair) = self.find_pair(local, remote).await else {
+            return;
+        };
+        self.set_role(!request.is_controlling).await;
+        // The new tie-breaker must differ, including in the (very unlikely) event
+        // that the random generator returns the old value.
+        let old_tie_breaker = self.tie_breaker.load(Ordering::SeqCst);
+        let mut tie_breaker = rand::random::<u64>();
+        while tie_breaker == old_tie_breaker {
+            tie_breaker = rand::random::<u64>();
+        }
+        self.tie_breaker.store(tie_breaker, Ordering::SeqCst);
+        pair.state
+            .store(CandidatePairState::Waiting as u8, Ordering::SeqCst);
+        pair.binding_request_count.store(0, Ordering::SeqCst);
+        let mut triggered = self.triggered_checks.lock().await;
+        if !triggered.iter().any(|p| Arc::ptr_eq(p, &pair)) {
+            triggered.push(pair);
+        }
+        drop(triggered);
+        self.request_connectivity_check();
     }
 
     /// Processes STUN traffic from a remote candidate.
@@ -827,6 +1004,7 @@ impl AgentInternal {
     ) {
         if m.typ.method != METHOD_BINDING
             || !(m.typ.class == CLASS_SUCCESS_RESPONSE
+                || m.typ.class == CLASS_ERROR_RESPONSE
                 || m.typ.class == CLASS_REQUEST
                 || m.typ.class == CLASS_INDICATION)
         {
@@ -841,32 +1019,11 @@ impl AgentInternal {
             return;
         }
 
-        if self.is_controlling.load(Ordering::SeqCst) {
-            if m.contains(ATTR_ICE_CONTROLLING) {
-                log::debug!(
-                    "[{}]: inbound isControlling && a.isControlling == true",
-                    self.get_name(),
-                );
-                return;
-            } else if m.contains(ATTR_USE_CANDIDATE) {
-                log::debug!(
-                    "[{}]: useCandidate && a.isControlling == true",
-                    self.get_name(),
-                );
-                return;
-            }
-        } else if m.contains(ATTR_ICE_CONTROLLED) {
-            log::debug!(
-                "[{}]: inbound isControlled && a.isControlling == false",
-                self.get_name(),
-            );
-            return;
-        }
-
+        let _role_guard = self.role_lock.lock().await;
         let mut remote_candidate = self
             .find_remote_candidate(local.network_type(), remote)
             .await;
-        if m.typ.class == CLASS_SUCCESS_RESPONSE {
+        if m.typ.class == CLASS_SUCCESS_RESPONSE || m.typ.class == CLASS_ERROR_RESPONSE {
             {
                 let ufrag_pwd = self.ufrag_pwd.lock().await;
                 if let Err(err) =
@@ -883,10 +1040,14 @@ impl AgentInternal {
             }
 
             if let Some(rc) = &remote_candidate {
+                if m.typ.class == CLASS_ERROR_RESPONSE {
+                    self.handle_role_conflict(m, local, rc).await;
+                    return;
+                }
                 self.handle_success_response(m, local, rc, remote).await;
             } else {
                 log::warn!(
-                    "[{}]: discard success message from ({}), no such remote",
+                    "[{}]: discard response from ({}), no such remote",
                     self.get_name(),
                     remote
                 );
@@ -916,6 +1077,10 @@ impl AgentInternal {
                     );
                     return;
                 }
+            }
+
+            if !self.resolve_role_conflict(m, local, remote).await {
+                return;
             }
 
             if remote_candidate.is_none() {
